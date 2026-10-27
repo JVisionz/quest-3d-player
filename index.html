@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quest 3D Player</title>
+<style>
+  :root { --bg:#0d0f14; --panel:#171a22; --line:#2a2f3c; --text:#e8eaf0; --muted:#8a90a2; --accent:#6ea8ff; --warn:#ffb86b; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:15px/1.4 system-ui,-apple-system,sans-serif; }
+  body { display:grid; grid-template-rows:auto 1fr auto; }
+  header { display:flex; gap:8px; align-items:center; padding:10px 14px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:17px; margin:0 auto 0 0; }
+  button, select, .btn { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:9px 14px; font:inherit; cursor:pointer; }
+  .btn input { display:none; }
+  button.primary { background:var(--accent); color:#0b1020; border-color:var(--accent); font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  main { display:grid; grid-template-columns:260px 1fr; min-height:0; }
+  #list { overflow:auto; border-right:1px solid var(--line); padding:6px; }
+  #list div { padding:8px 10px; border-radius:6px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; }
+  #list div.active { background:var(--accent); color:#0b1020; }
+  #list div:hover:not(.active) { background:var(--panel); }
+  #stage { position:relative; min-height:0; overflow:hidden; }
+  #stage canvas { width:100%; height:100%; display:block; touch-action:none; }
+  #hint { position:absolute; inset:0; display:grid; place-items:center; text-align:center; color:var(--muted); padding:20px; pointer-events:none; }
+  #msg { position:absolute; left:12px; right:12px; bottom:12px; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; display:none; }
+  #msg.err { border-color:var(--warn); color:var(--warn); }
+  footer { display:flex; flex-wrap:wrap; gap:10px; align-items:center; padding:10px 14px; border-top:1px solid var(--line); }
+  footer label { display:flex; gap:6px; align-items:center; color:var(--muted); font-size:13px; }
+  #seek { flex:1 1 220px; }
+  #time { font-variant-numeric:tabular-nums; color:var(--muted); font-size:13px; min-width:110px; }
+  #modeNow { color:var(--muted); font-size:12px; }
+  #media { position:fixed; left:0; top:0; width:1px; height:1px; overflow:hidden; opacity:0; pointer-events:none; }
+  @media (max-width:720px) { main { grid-template-columns:1fr; grid-template-rows:130px 1fr; } #list { border-right:0; border-bottom:1px solid var(--line); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Quest 3D Player</h1>
+  <label class="btn">Open files<input id="files" type="file" multiple accept="image/*,video/*,.mkv,.avi,.wmv,.flv,.ts,.m2ts,.mts,.heic,.heif"></label>
+  <label class="btn">Open folder<input id="folder" type="file" webkitdirectory multiple></label>
+  <button id="vr" class="primary" disabled>Checking VR…</button>
+</header>
+
+<main>
+  <div id="list"></div>
+  <div id="stage">
+    <div id="hint">Open files or a folder to start.<br>On Quest, downloads are under Downloads, Movies or Pictures in the file picker.<br>Then press Enter VR.</div>
+    <div id="msg"></div>
+  </div>
+</main>
+
+<footer>
+  <button id="prev" title="Previous (P)">⏮</button>
+  <button id="play" title="Play/Pause (Space)">▶ Play</button>
+  <button id="next" title="Next (N)">⏭</button>
+  <input id="seek" type="range" min="0" max="0" step="any" value="0" disabled>
+  <span id="time"></span>
+  <label>Speed <select id="speed"></select></label>
+  <label>Zoom <input id="zoom" type="range" min="0.25" max="4" step="0.05" value="1"> <span id="zoomVal">1.00x</span></label>
+  <label>Mode <select id="mode"></select> <span id="modeNow"></span></label>
+  <label><input id="swap" type="checkbox"> Swap eyes</label>
+</footer>
+<div id="media"></div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+const $ = s => document.querySelector(s);
+const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+const SCREEN_H = 1.5, SCREEN_D = 2.4, ZMIN = 0.25, ZMAX = 4;
+const MODES = {
+  flat:    { label:'2D flat',            shape:'flat', stereo:'mono' },
+  sbs:     { label:'3D side-by-side',    shape:'flat', stereo:'sbs'  },
+  tb:      { label:'3D top/bottom',      shape:'flat', stereo:'tb'   },
+  '180':   { label:'180° mono',          shape:'180',  stereo:'mono' },
+  '180sbs':{ label:'180° 3D SBS',        shape:'180',  stereo:'sbs'  },
+  '360':   { label:'360° mono',          shape:'360',  stereo:'mono' },
+  '360tb': { label:'360° 3D top/bottom', shape:'360',  stereo:'tb'   },
+  '360sbs':{ label:'360° 3D SBS',        shape:'360',  stereo:'sbs'  },
+};
+const MODE_KEYS = Object.keys(MODES);
+const VIDEO_EXT = /\.(mp4|m4v|mov|webm|mkv|ogv|avi|wmv|flv|mpg|mpeg|ts|mts|m2ts|3gp|3g2|hevc|h264)$/i;
+const IMAGE_EXT = /\.(jpe?g|png|apng|gif|webp|avif|bmp|svg|ico|heic|heif|tiff?|jxl)$/i;
+
+const state = { files:[], index:-1, kind:null, el:null, img:null, anim:null, url:null, w:0, h:0,
+  modePref:'auto', mode:'flat', swap:false, zoom:1, speed:1, eyeAspect:16/9,
+  dirty:false, lastBuild:0, error:'' };
+let texture = null, meshes = [], loadToken = 0, lastVT = -1, texReady = false;
+
+// ---------- Renderer / scene ----------
+const stage = $('#stage');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local');
+renderer.xr.setFoveation(0.25);
+stage.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x040508);
+const camera = new THREE.PerspectiveCamera(75, 1, 0.05, 200);
+camera.rotation.order = 'YXZ';
+camera.layers.enable(1); // 2D preview shows the left-eye image
+
+function resize() {
+  if (renderer.xr.isPresenting) return;
+  const r = stage.getBoundingClientRect();
+  renderer.setSize(r.width, r.height, false);
+  camera.aspect = r.width / Math.max(1, r.height);
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+
+// ---------- Geometry ----------
+function eyeRegion(stereo, eye) { // [u0, v0, width, height] in texture space
+  if (state.swap) eye = 1 - eye;
+  if (stereo === 'sbs') return [eye * 0.5, 0, 0.5, 1];
+  if (stereo === 'tb')  return [0, eye === 0 ? 0.5 : 0, 1, 0.5]; // top half = left eye
+  return [0, 0, 1, 1];
+}
+function remapUV(geo, [u0, v0, uw, vh], crop) {
+  const uv = geo.attributes.uv;
+  for (let i = 0; i < uv.count; i++) {
+    const u = 0.5 + (uv.getX(i) - 0.5) * crop;
+    const v = 0.5 + (uv.getY(i) - 0.5) * crop;
+    uv.setXY(i, u0 + u * uw, v0 + v * vh);
+  }
+  uv.needsUpdate = true;
+}
+function sphereGeo(shape, zoom) {
+  let phiLen = shape === '360' ? Math.PI * 2 : Math.PI, thetaLen = Math.PI;
+  if (zoom < 1) { phiLen *= zoom; thetaLen *= zoom; }   // zoom out: shrink the dome
+  const g = new THREE.SphereGeometry(40, 96, 48,
+    Math.PI * 1.5 - phiLen / 2, phiLen,                  // centred straight ahead (-Z)
+    Math.PI / 2 - thetaLen / 2, thetaLen);
+  g.scale(-1, 1, 1);                                     // view from inside
+  return g;
+}
+function eyeAspect(stereo, w, h) {
+  const a = w / h;
+  if (stereo === 'sbs') return a >= 2.5 ? a / 2 : a;     // full-SBS vs half-SBS
+  if (stereo === 'tb')  return a <= 1.2 ? a * 2 : a;     // full-TB vs half-TB
+  return a;
+}
+function rebuild() {
+  state.dirty = false; state.lastBuild = performance.now();
+  for (const m of meshes) { scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
+  meshes = [];
+  if (!texture) return;
+  const M = MODES[state.mode];
+  state.eyeAspect = eyeAspect(M.stereo, state.w, state.h);
+  for (let eye = 0; eye < 2; eye++) {
+    let g, crop = 1;
+    if (M.shape === 'flat') g = new THREE.PlaneGeometry(1, 1);
+    else { g = sphereGeo(M.shape, state.zoom); if (state.zoom > 1) crop = 1 / state.zoom; } // zoom in: magnify centre
+    remapUV(g, eyeRegion(M.stereo, eye), crop);
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ map:texture, toneMapped:false }));
+    m.layers.set(eye + 1);  // layer 1 = left eye, layer 2 = right eye
+    scene.add(m); meshes.push(m);
+  }
+  applyFlatScale();
+}
+function applyFlatScale() {
+  if (MODES[state.mode].shape !== 'flat') return;
+  const h = SCREEN_H * state.zoom;
+  for (const m of meshes) { m.scale.set(h * state.eyeAspect, h, 1); m.position.set(0, 0, -SCREEN_D); }
+}
+function detectMode(name, w, h) {
+  const n = name.toLowerCase(), a = w / h;
+  const sbs = /(^|[^a-z])(sbs|lr|3dh|hsbs|fsbs|side.?by.?side)([^a-z]|$)/.test(n);
+  const tb  = /(^|[^a-z])(tb|ou|ab|3dv|htab|top.?bottom|over.?under)([^a-z]|$)/.test(n);
+  if (/180/.test(n)) return (sbs || a >= 1.8) ? '180sbs' : '180';
+  if (/360/.test(n)) return (tb || a <= 1.1) ? '360tb' : sbs ? '360sbs' : '360';
+  if (sbs) return 'sbs';
+  if (tb) return 'tb';
+  return a >= 3.2 ? 'sbs' : 'flat';
+}
+
+// ---------- In-VR HUD ----------
+const hudCanvas = document.createElement('canvas'); hudCanvas.width = 1024; hudCanvas.height = 300;
+const hctx = hudCanvas.getContext('2d');
+const hudTex = new THREE.CanvasTexture(hudCanvas); hudTex.colorSpace = THREE.SRGBColorSpace;
+const hud = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 1.1 * 300 / 1024),
+  new THREE.MeshBasicMaterial({ map:hudTex, transparent:true, depthTest:false, toneMapped:false }));
+hud.position.set(0, -0.55, -1.4); hud.rotation.x = -0.3; hud.renderOrder = 10; hud.visible = false;
+scene.add(hud);
+let hudUntil = 0, hudPinned = false, hudLastDraw = 0;
+const touch = () => { hudUntil = performance.now() + 4000; };
+
+function fitText(c, s, max) { if (c.measureText(s).width <= max) return s; while (s.length > 1 && c.measureText(s + '…').width > max) s = s.slice(0, -1); return s + '…'; }
+function drawHud() {
+  const c = hctx, W = 1024, H = 300;
+  c.clearRect(0, 0, W, H);
+  c.fillStyle = 'rgba(15,18,26,0.88)'; c.beginPath(); c.roundRect(0, 0, W, H, 28); c.fill();
+  const f = state.files[state.index];
+  c.fillStyle = '#e8eaf0'; c.font = '600 38px system-ui,sans-serif';
+  c.fillText(fitText(c, f ? f.name : 'No files — open them on the 2D page first', W - 60), 30, 58);
+  c.font = '30px system-ui,sans-serif'; c.fillStyle = '#b8bfd0';
+  const status = state.kind === 'image' && !state.anim ? 'Photo' : (isPaused() ? 'Paused' : 'Playing');
+  c.fillText([status, `${state.speed}x`, `Zoom ${state.zoom.toFixed(2)}x`, MODES[state.mode].label + (state.swap ? ' (swapped)' : '')].join('  •  '), 30, 106);
+  if (state.error) {
+    c.fillStyle = '#ffb86b'; c.font = '26px system-ui,sans-serif'; c.fillText(fitText(c, state.error, W - 60), 30, 160);
+  } else if (state.kind === 'video') {
+    const v = state.el, d = v.duration || 0;
+    c.fillStyle = '#2a2f3c'; c.fillRect(30, 135, W - 60, 12);
+    c.fillStyle = '#6ea8ff'; c.fillRect(30, 135, (W - 60) * (d ? v.currentTime / d : 0), 12);
+    c.fillStyle = '#b8bfd0'; c.font = '26px system-ui,sans-serif'; c.fillText(`${fmt(v.currentTime)} / ${fmt(d)}`, 30, 182);
+  }
+  c.fillStyle = '#8a90a2'; c.font = '23px system-ui,sans-serif';
+  c.fillText('R trigger play/pause · R stick ↕ zoom ↔ seek 10s · A/B next/prev', 30, 232);
+  c.fillText('L stick ↕ speed ↔ seek 60s · X 3D mode · Y swap eyes · L trigger reset · grip pin HUD', 30, 268);
+  hudTex.needsUpdate = true;
+}
+
+// ---------- Playback controls ----------
+const isPaused = () => state.kind === 'video' ? state.el.paused : state.anim ? state.anim.paused : true;
+function togglePlay() {
+  if (state.kind === 'video') { const v = state.el; v.paused ? v.play().catch(() => {}) : v.pause(); }
+  else if (state.anim) { state.anim.paused = !state.anim.paused; state.anim.nextAt = performance.now(); }
+  touch();
+}
+function setSpeed(s) { state.speed = s; if (state.kind === 'video') { state.el.playbackRate = s; state.el.defaultPlaybackRate = s; } touch(); }
+function stepSpeed(dir) {
+  let i = SPEEDS.reduce((best, s, k) => Math.abs(s - state.speed) < Math.abs(SPEEDS[best] - state.speed) ? k : best, 0);
+  setSpeed(SPEEDS[Math.max(0, Math.min(SPEEDS.length - 1, i + dir))]);
+}
+function setZoom(z) {
+  state.zoom = Math.min(ZMAX, Math.max(ZMIN, z));
+  if (MODES[state.mode].shape === 'flat') applyFlatScale(); else state.dirty = true;
+  touch();
+}
+function seek(s) {
+  if (state.kind !== 'video') return;
+  const v = state.el; v.currentTime = Math.max(0, Math.min((v.duration || 0) - 0.1, v.currentTime + s)); touch();
+}
+function setMode(pref) {
+  state.modePref = pref;
+  const f = state.files[state.index];
+  state.mode = pref === 'auto' ? (f && state.w ? detectMode(f.name, state.w, state.h) : 'flat') : pref;
+  rebuild(); touch();
+}
+function cycleMode() { setMode(MODE_KEYS[(MODE_KEYS.indexOf(state.mode) + 1) % MODE_KEYS.length]); }
+function toggleSwap() { state.swap = !state.swap; rebuild(); touch(); }
+function resetView() { setZoom(1); setSpeed(1); if (!renderer.xr.isPresenting) camera.rotation.set(0, 0, 0); }
+const next = () => load(state.index + 1);
+const prev = () => load(state.index - 1);
+
+// ---------- Loading media ----------
+const isVideo = f => f.type.startsWith('video/') || (!f.type.startsWith('image/') && VIDEO_EXT.test(f.name));
+function formatHelp(f) {
+  const ext = (f.name.split('.').pop() || '').toLowerCase();
+  if (ext === 'heic' || ext === 'heif') return 'HEIC photos can\'t be decoded by the Quest browser. Convert to JPG (or set your phone camera to "Most Compatible").';
+  if (ext === 'tif' || ext === 'tiff') return 'TIFF isn\'t supported by the browser. Convert to PNG or JPG.';
+  if (!isVideo(f)) return 'This image format isn\'t supported by the Quest browser.';
+  return `The Quest browser can't decode this video (.${ext}). Convert to MP4: ffmpeg -i "${f.name}" -c:v libx264 -crf 18 -c:a aac out.mp4`;
+}
+function loadVideo(url) {
+  return new Promise((res, rej) => {
+    const v = document.createElement('video');
+    v.playsInline = true; v.loop = true; v.preload = 'auto';
+    v.onloadedmetadata = () => v.videoWidth ? res({ kind:'video', el:v, w:v.videoWidth, h:v.videoHeight })
+                                           : (v.remove(), rej(new Error('no video track')));
+    v.onerror = () => { v.remove(); rej(new Error('decode')); };
+    v.src = url; $('#media').appendChild(v);
+  });
+}
+async function loadImage(f, url) {
+  if ('ImageDecoder' in window && /^image\/(gif|webp|png|apng|avif)$/.test(f.type)) {
+    let dec;
+    try {
+      dec = new ImageDecoder({ data: await f.arrayBuffer(), type: f.type });
+      await dec.completed;
+      const tr = dec.tracks.selectedTrack;
+      if (tr && tr.animated && tr.frameCount > 1) {          // animated GIF/WebP/APNG
+        const { image: vf } = await dec.decode({ frameIndex: 0 });
+        const canvas = document.createElement('canvas');
+        canvas.width = vf.displayWidth; canvas.height = vf.displayHeight;
+        const ctx = canvas.getContext('2d'); ctx.drawImage(vf, 0, 0);
+        const dur = (vf.duration ?? 100000) / 1000; vf.close();
+        return { kind:'image', w:canvas.width, h:canvas.height,
+                 anim:{ dec, canvas, ctx, frame:0, count:tr.frameCount, nextAt:performance.now() + dur / state.speed, busy:false, paused:false } };
+      }
+    } catch {}
+    dec?.close();
+  }
+  const img = new Image(); img.decoding = 'async'; img.src = url;
+  await img.decode();
+  if (!img.naturalWidth) throw new Error('no size');
+  return { kind:'image', img, w:img.naturalWidth, h:img.naturalHeight };
+}
+function makeTexture(r) {
+  let t;
+  if (r.el) { t = new THREE.VideoTexture(r.el); t.generateMipmaps = false; t.minFilter = THREE.LinearFilter; }
+  else if (r.anim) t = new THREE.CanvasTexture(r.anim.canvas);
+  else { t = new THREE.Texture(r.img); t.needsUpdate = true; t.anisotropy = renderer.capabilities.getMaxAnisotropy(); }
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+function disposeMedia(r) {
+  if (r.el) { r.el.pause(); r.el.removeAttribute('src'); r.el.load(); r.el.remove(); }
+  if (r.anim) r.anim.dec.close();
+}
+function unload() {
+  disposeMedia({ el: state.el, anim: state.anim });
+  Object.assign(state, { kind:null, el:null, img:null, anim:null, w:0, h:0 });
+  if (texture) { texture.dispose(); texture = null; }
+  if (state.url) { URL.revokeObjectURL(state.url); state.url = null; }
+  rebuild();
+}
+async function load(i) {
+  if (!state.files.length) return;
+  const n = state.files.length, idx = ((i % n) + n) % n;
+  const token = ++loadToken;
+  unload();
+  state.index = idx; state.error = ''; renderList(); $('#hint').hidden = true;
+  const f = state.files[idx], url = URL.createObjectURL(f); state.url = url;
+  let r;
+  try { r = isVideo(f) ? await loadVideo(url) : await loadImage(f, url); }
+  catch {
+    if (token !== loadToken) return;
+    state.error = formatHelp(f); showMsg(`${f.name}: ${state.error}`, true); touch(); syncUI(); return;
+  }
+  if (token !== loadToken) { disposeMedia(r); return; }
+  Object.assign(state, { kind:r.kind, el:r.el || null, img:r.img || null, anim:r.anim || null, w:r.w, h:r.h });
+  texture = makeTexture(r); lastVT = -1; texReady = false;
+  state.mode = state.modePref === 'auto' ? detectMode(f.name, r.w, r.h) : state.modePref;
+  rebuild();
+  if (r.kind === 'video') {
+    r.el.playbackRate = r.el.defaultPlaybackRate = state.speed;
+    r.el.play().catch(() => showMsg('Press Play to start.'));
+  }
+  hideMsg(); touch(); syncUI();
+}
+function tickAnim(now) {
+  const a = state.anim;
+  if (!a || a.busy || a.paused || now < a.nextAt) return;
+  a.busy = true; a.frame = (a.frame + 1) % a.count;
+  a.dec.decode({ frameIndex: a.frame }).then(({ image: vf }) => {
+    if (state.anim !== a) { vf.close(); return; }
+    a.ctx.clearRect(0, 0, a.canvas.width, a.canvas.height); a.ctx.drawImage(vf, 0, 0);
+    texture.needsUpdate = true;
+    a.nextAt = performance.now() + ((vf.duration ?? 100000) / 1000) / state.speed;
+    vf.close(); a.busy = false;
+  }).catch(() => { a.busy = false; });
+}
+
+// ---------- 2D page UI ----------
+const playBtn = $('#play'), seekEl = $('#seek'), timeEl = $('#time'), zoomEl = $('#zoom'), zoomVal = $('#zoomVal');
+const speedEl = $('#speed'), modeSel = $('#mode'), swapEl = $('#swap'), vrBtn = $('#vr'), msgEl = $('#msg');
+SPEEDS.forEach(s => speedEl.add(new Option(`${s}x`, String(s))));
+modeSel.add(new Option('Auto-detect', 'auto'));
+MODE_KEYS.forEach(k => modeSel.add(new Option(MODES[k].label, k)));
+speedEl.value = '1';
+
+let msgTimer;
+function showMsg(text, err = false) { msgEl.textContent = text; msgEl.className = err ? 'err' : ''; msgEl.style.display = 'block'; clearTimeout(msgTimer); msgTimer = setTimeout(hideMsg, err ? 12000 : 5000); }
+function hideMsg() { msgEl.style.display = 'none'; }
+function fmt(t) {
+  if (!isFinite(t)) return '--:--';
+  t = Math.floor(t); const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, s = t % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+}
+function renderList() {
+  const list = $('#list'); list.replaceChildren();
+  state.files.forEach((f, i) => {
+    const d = document.createElement('div');
+    d.textContent = f.webkitRelativePath || f.name; d.title = d.textContent;
+    if (i === state.index) d.className = 'active';
+    d.onclick = () => load(i);
+    list.appendChild(d);
+  });
+  list.querySelector('.active')?.scrollIntoView({ block:'nearest' });
+}
+let seeking = false;
+function syncUI() {
+  const v = state.kind === 'video' ? state.el : null, still = state.kind === 'image' && !state.anim;
+  playBtn.disabled = !state.kind || still;
+  playBtn.textContent = isPaused() ? '▶ Play' : '⏸ Pause';
+  seekEl.disabled = !v;
+  if (v && !seeking) { seekEl.max = v.duration || 0; seekEl.value = v.currentTime; }
+  timeEl.textContent = v ? `${fmt(v.currentTime)} / ${fmt(v.duration)}` : state.anim ? `frame ${state.anim.frame + 1}/${state.anim.count}` : '';
+  zoomEl.value = state.zoom; zoomVal.textContent = state.zoom.toFixed(2) + 'x';
+  speedEl.value = String(state.speed); modeSel.value = state.modePref; swapEl.checked = state.swap;
+  $('#modeNow').textContent = state.modePref === 'auto' && state.kind ? '→ ' + MODES[state.mode].label : '';
+}
+function addFiles(list) {
+  const arr = [...list].filter(f => f.type.startsWith('video/') || f.type.startsWith('image/') || VIDEO_EXT.test(f.name) || IMAGE_EXT.test(f.name));
+  if (!arr.length) { showMsg('No photos or videos found in that selection.', true); return; }
+  arr.sort((a, b) => (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name, undefined, { numeric:true, sensitivity:'base' }));
+  const start = state.files.length; state.files.push(...arr); load(start);
+}
+
+$('#files').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+$('#folder').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+$('#prev').onclick = prev; $('#next').onclick = next; playBtn.onclick = togglePlay;
+seekEl.addEventListener('pointerdown', () => seeking = true);
+seekEl.addEventListener('pointerup', () => seeking = false);
+seekEl.oninput = () => { if (state.kind === 'video') state.el.currentTime = +seekEl.value; };
+speedEl.onchange = () => setSpeed(+speedEl.value);
+zoomEl.oninput = () => setZoom(+zoomEl.value);
+modeSel.onchange = () => setMode(modeSel.value);
+swapEl.onchange = toggleSwap;
+
+stage.addEventListener('dragover', e => e.preventDefault());
+stage.addEventListener('drop', e => { e.preventDefault(); addFiles(e.dataTransfer.files); });
+
+// Drag to look around, wheel to zoom, double-click to reset (2D preview)
+const cv = renderer.domElement; let drag = null;
+cv.addEventListener('pointerdown', e => { drag = { x:e.clientX, y:e.clientY, yaw:camera.rotation.y, pitch:camera.rotation.x }; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener('pointermove', e => {
+  if (!drag) return;
+  camera.rotation.y = drag.yaw + (e.clientX - drag.x) * 0.004;
+  camera.rotation.x = Math.max(-1.4, Math.min(1.4, drag.pitch + (e.clientY - drag.y) * 0.004));
+});
+cv.addEventListener('pointerup', () => drag = null);
+cv.addEventListener('wheel', e => { e.preventDefault(); setZoom(state.zoom * Math.exp(-e.deltaY * 0.001)); }, { passive:false });
+cv.addEventListener('dblclick', resetView);
+
+addEventListener('keydown', e => {
+  const t = e.target;
+  if (t.tagName === 'SELECT' || (t.tagName === 'INPUT' && t.type !== 'range' && t.type !== 'checkbox')) return;
+  const k = e.key, act = {
+    ' ': togglePlay, ArrowRight: () => seek(5), ArrowLeft: () => seek(-5),
+    ArrowUp: () => setZoom(state.zoom * 1.1), ArrowDown: () => setZoom(state.zoom / 1.1),
+    ']': () => stepSpeed(1), '[': () => stepSpeed(-1), n: next, p: prev, m: cycleMode, s: toggleSwap, r: resetView,
+  }[k];
+  if (act) { e.preventDefault(); act(); }
+});
+
+// ---------- WebXR ----------
+if (!window.isSecureContext) { vrBtn.textContent = 'VR needs HTTPS'; }
+else if (!navigator.xr) { vrBtn.textContent = 'VR not available'; }
+else navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+  vrBtn.disabled = !ok; vrBtn.textContent = ok ? 'Enter VR' : 'VR not available';
+});
+vrBtn.onclick = async () => {
+  if (renderer.xr.isPresenting) { renderer.xr.getSession().end(); return; }
+  try {
+    const s = await navigator.xr.requestSession('immersive-vr');
+    s.addEventListener('select', e => e.inputSource.handedness === 'left' ? resetView() : togglePlay());
+    s.addEventListener('squeeze', () => { hudPinned = !hudPinned; touch(); });
+    s.addEventListener('end', () => { camera.layers.enable(1); vrBtn.textContent = 'Enter VR'; resize(); });
+    await renderer.xr.setSession(s);
+    camera.layers.disable(1); camera.rotation.set(0, 0, 0);
+    vrBtn.textContent = 'Exit VR'; touch();
+    if (state.kind === 'video' && state.el.paused) state.el.play().catch(() => {});
+  } catch (err) { showMsg('Could not start VR: ' + err.message, true); }
+};
+
+const btnPrev = {}, latched = {};
+function pollXR(dt) {
+  const s = renderer.xr.getSession(); if (!s) return;
+  for (const src of s.inputSources) {
+    const gp = src.gamepad; if (!gp) continue;
+    const h = src.handedness, x = gp.axes[2] ?? 0, y = gp.axes[3] ?? 0;
+    const edge = i => { const k = h + i, p = !!gp.buttons[i]?.pressed, was = btnPrev[k]; btnPrev[k] = p; return p && !was; };
+    const flick = (k, val, fn) => {
+      if (Math.abs(val) < 0.3) { latched[k] = false; return; }
+      if (Math.abs(val) > 0.75 && !latched[k]) { latched[k] = true; fn(Math.sign(val)); }
+    };
+    if (h === 'right') {
+      if (Math.abs(y) > 0.15) setZoom(state.zoom * Math.exp(-y * dt * 1.5));  // push up = zoom in
+      flick('rx', x, d => seek(d * 10));
+      if (edge(4)) next();      // A
+      if (edge(5)) prev();      // B
+    } else if (h === 'left') {
+      flick('ly', -y, d => stepSpeed(d));
+      flick('lx', x, d => seek(d * 60));
+      if (edge(4)) cycleMode(); // X
+      if (edge(5)) toggleSwap(); // Y
+    }
+  }
+}
+
+// ---------- Main loop ----------
+let lastT = performance.now(), uiLast = 0;
+renderer.setAnimationLoop(() => {
+  const now = performance.now(), dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  if (renderer.xr.isPresenting) pollXR(dt);
+  if (state.kind === 'video' && texture) {
+    const v = state.el;
+    if (v.readyState >= 2 && (v.currentTime !== lastVT || !texReady)) { texture.needsUpdate = true; lastVT = v.currentTime; texReady = true; }
+  }
+  tickAnim(now);
+  if (state.dirty && now - state.lastBuild > 60) rebuild();
+  const showHud = renderer.xr.isPresenting && (hudPinned || now < hudUntil);
+  hud.visible = showHud;
+  if (showHud && now - hudLastDraw > 200) { drawHud(); hudLastDraw = now; }
+  if (!renderer.xr.isPresenting && now - uiLast > 250) { syncUI(); uiLast = now; }
+  renderer.render(scene, camera);
+});
+resize(); syncUI();
+</script>
+</body>
+</html>
